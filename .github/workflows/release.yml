@@ -1,0 +1,96 @@
+name: Enterprise Billixi Release & Provenance Pipeline
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*' # Strict semantic versioning tags
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+permissions:
+  id-token: write # Mandatory for secure OIDC token exchange
+  contents: write # Required for creating GitHub releases if needed
+
+jobs:
+  build-and-attest:
+    name: Build & Generate Provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history for accurate versioning/changelogs
+
+      - name: Set up Environment & Tooling
+        uses: actions/setup-node@v4 # Or setup-python / setup-go depending on your stack
+        with:
+          node-version: '20'
+
+      - name: Make Build Script Executable
+        run: chmod +x ./scripts/build-release.sh
+
+      - name: Execute Hardened Build Process
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          BUILD_ENV: ${{ inputs.environment || 'production' }}
+        run: ./scripts/build-release.sh
+
+      - name: Authenticate and Publish Build Proof to Billixi
+        env:
+          BILLIXI_PROOF_ENDPOINT: "https://billixi.com/api/v1/proofs"
+          PRODUCT_ID: "59" # Mapped from your Billixi product dashboard URL[span_1](start_span)[span_1](end_span)
+        run: |
+          echo "==> Requesting GitHub OIDC Token..."
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL}" ]; then
+            echo "Error: OIDC token URL is missing. Ensure 'permissions: id-token: write' is set."
+            exit 1
+          fi
+
+          oidc_token=$(curl -sLS "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=billixi.com" \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r '.value')
+
+          if [ -z "$oidc_token" ] || [ "$oidc_token" = "null" ]; then
+            echo "Error: Failed to retrieve OIDC token from GitHub."
+            exit 1
+          fi
+
+          echo "==> Locating release asset in ./dist..."
+          ARTIFACT_PATH=$(find ./dist -type f \( -name "*.zip" -o -name "*.tar.gz" -o -name "*.bin" -o -name "*.AppImage" \) | head -n 1)
+          
+          if [ -z "$ARTIFACT_PATH" ]; then
+            echo "Error: No valid build artifact found in ./dist directory."
+            exit 1
+          fi
+
+          artifactName="$(basename "$ARTIFACT_PATH")"
+          artifactSha256="$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')"
+
+          echo "Found Artifact: $artifactName"
+          echo "SHA-256 Checksum: $artifactSha256"
+
+          echo "==> Constructing secure payload..."
+          body=$(jq -n \
+            --arg productId "$PRODUCT_ID" \
+            --arg artifactSha256 "$artifactSha256" \
+            --arg artifactName "$artifactName" \
+            '{productId: $productId, artifactSha256: $artifactSha256, artifactName: $artifactName}')
+
+          echo "==> Submitting build provenance to Billixi..."
+          curl --silent --show-error --fail-with-body \
+            -X POST \
+            -H "Authorization: Bearer ${oidc_token}" \
+            -H "Content-Type: application/json" \
+            --data "$body" "${BILLIXI_PROOF_ENDPOINT}"
+
+          echo "Successfully submitted build provenance proof!"
+          unset oidc_token
