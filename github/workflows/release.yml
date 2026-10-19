@@ -1,0 +1,383 @@
+name: Billixi Release Proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semantic version without a leading v, e.g. 1.2.3 or 1.2.3-rc.1"
+        required: true
+        type: string
+
+# Serialize releases of the same version. This reduces concurrent-release
+# races; the remote tag push below provides an additional collision check.
+concurrency:
+  group: billixi-release-${{ github.repository }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  # The artifact path must be identical in both jobs.
+  BILLIXI_ARTIFACT_PATH: dist/my-product.zip
+
+  # Directory produced by the project-specific build command.
+  # Change this to match your compiler's actual output directory.
+  BUILD_OUTPUT_DIR: build
+
+jobs:
+  # ------------------------------------------------------------
+  # JOB 1: Build and package
+  #
+  # This job deliberately has no OIDC permission and cannot create
+  # releases. Repository build code runs only with read-only access.
+  # ------------------------------------------------------------
+  build:
+    name: Build release artifact
+
+    # Releases may only be initiated from the repository's default branch.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The build does not need persistent Git credentials.
+          persist-credentials: false
+
+      - name: Validate semantic version
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          # SemVer 2.0.0 validation:
+          # - Numeric major.minor.patch components
+          # - Optional prerelease identifiers
+          # - Optional build metadata
+          # - No leading zeroes in numeric core or numeric prerelease identifiers
+          SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
+
+          if [[ ! "$RELEASE_VERSION" =~ $SEMVER_RE ]]; then
+            echo "::error::Invalid version '$RELEASE_VERSION'. Use SemVer, for example 1.2.3 or 1.2.3-rc.1."
+            exit 1
+          fi
+
+          echo "Validated release version: $RELEASE_VERSION"
+
+      - name: Build and package the application
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # scripts/build-release.sh contains the project-specific build
+          # function and the common packaging logic.
+          ./scripts/build-release.sh
+
+          # Fail immediately if the script did not create the expected file.
+          test -s "$BILLIXI_ARTIFACT_PATH"
+
+          # Check that the resulting ZIP archive is readable.
+          unzip -t "$BILLIXI_ARTIFACT_PATH"
+
+          echo "Build artifact created successfully."
+
+      - name: Upload the exact release archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-archive
+          path: dist/my-product.zip
+          if-no-files-found: error
+          retention-days: 1
+
+          # The artifact is already a ZIP file; avoid unnecessary compression
+          # of the archive when transferring it between jobs.
+          compression-level: 0
+
+  # ------------------------------------------------------------
+  # JOB 2: Verify, attest and publish
+  #
+  # Only this job receives repository write permission and the ability
+  # to request a GitHub OIDC token.
+  # ------------------------------------------------------------
+  publish:
+    name: Prove and publish release
+
+    needs: build
+
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Configure this environment in GitHub repository settings.
+    # Add required reviewers and deployment protection rules as appropriate.
+    environment: production
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # This job needs Git credentials for the final tag push.
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Download the build artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-archive
+          path: dist
+
+      - name: Validate the downloaded artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s "$BILLIXI_ARTIFACT_PATH"
+          unzip -t "$BILLIXI_ARTIFACT_PATH"
+
+          echo "Downloaded release artifact is present and readable."
+
+      - name: Reject an existing release tag
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          tag="v${RELEASE_VERSION}"
+
+          # Query the remote repository, not just the local checkout.
+          # Exit code 0 means the tag exists.
+          # Exit code 2 means no matching ref was found.
+          # Other errors fail closed instead of being treated as "not found".
+          if git ls-remote --exit-code --refs origin "refs/tags/${tag}" >/dev/null; then
+            echo "::error::Tag '${tag}' already exists. Choose a new version."
+            exit 1
+          else
+            status=$?
+
+            if [[ "$status" -ne 2 ]]; then
+              echo "::error::Could not reliably check whether tag '${tag}' exists. Git exited with status ${status}."
+              exit "$status"
+            fi
+          fi
+
+          echo "Remote tag ${tag} does not exist."
+
+      - name: Prove the exact build to Billixi
+        id: prove
+        shell: bash
+        env:
+          BILLIXI_PRODUCT_ID: 59a50387-1719-49a1-a011-c62cb1a32a90
+          BILLIXI_PROOF_ENDPOINT: https://api.billixi.com/api/v1/payment/source-providers/github/actions/build-proofs
+          BILLIXI_AUDIENCE_PREFIX: billixi-source-trust
+        run: |
+          set -euo pipefail
+
+          # ----------------------------------------------------------
+          # 1. Validate the inputs required for the proof request.
+          # ----------------------------------------------------------
+          test -s "$BILLIXI_ARTIFACT_PATH"
+
+          [[ "$BILLIXI_PROOF_ENDPOINT" == https://* ]] || {
+            echo "::error::The verification endpoint must use HTTPS."
+            exit 1
+          }
+
+          [[ "$BILLIXI_PRODUCT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
+            echo "::error::BILLIXI_PRODUCT_ID is not a valid UUID."
+            exit 1
+          }
+
+          [[ "$BILLIXI_AUDIENCE_PREFIX" =~ ^[A-Za-z0-9._-]+$ ]] || {
+            echo "::error::Invalid OIDC audience prefix."
+            exit 1
+          }
+
+          : "${ACTIONS_ID_TOKEN_REQUEST_URL:?GitHub OIDC request URL is unavailable}"
+          : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?GitHub OIDC request token is unavailable}"
+
+          # ----------------------------------------------------------
+          # 2. Hash the exact ZIP file that will later be published.
+          # ----------------------------------------------------------
+          artifact_sha256="$(sha256sum -- "$BILLIXI_ARTIFACT_PATH" | awk '{print $1}')"
+
+          [[ "$artifact_sha256" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "::error::Failed to compute a valid SHA-256 checksum."
+            exit 1
+          }
+
+          # Billixi's example audience format uses the compact UUID.
+          product_id_compact="$(
+            printf '%s' "$BILLIXI_PRODUCT_ID" |
+              tr -d '-' |
+              tr '[:upper:]' '[:lower:]'
+          )"
+
+          # This binds the signed JWT's audience claim to the product and
+          # exact artifact checksum. Keep this format aligned with the
+          # verification service's configured contract.
+          audience="${BILLIXI_AUDIENCE_PREFIX}:${product_id_compact}:${artifact_sha256}"
+
+          # URI-encode the whole audience value before adding it to the
+          # GitHub OIDC token-request URL.
+          encoded_audience="$(jq -rn --arg value "$audience" '$value | @uri')"
+          oidc_request_url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${encoded_audience}"
+
+          # ----------------------------------------------------------
+          # 3. Request a short-lived, GitHub-signed OIDC JWT.
+          #
+          # Never print the request URL's authorization token or the JWT.
+          # Do not enable curl redirects: the token must go only to the
+          # GitHub-provided OIDC endpoint.
+          # ----------------------------------------------------------
+          oidc_response="$(
+            curl \
+              --proto '=https' \
+              --tlsv1.2 \
+              --silent \
+              --show-error \
+              --fail \
+              --connect-timeout 10 \
+              --max-time 20 \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              -H 'Accept: application/json' \
+              "$oidc_request_url"
+          )"
+
+          oidc_token="$(
+            jq -er '.value | select(type == "string" and length > 0)' \
+              <<<"$oidc_response"
+          )"
+
+          # Register the token with GitHub Actions log masking as a
+          # defense-in-depth measure against accidental disclosure.
+          echo "::add-mask::$oidc_token"
+
+          # ----------------------------------------------------------
+          # 4. Build the JSON request body with jq.
+          #
+          # jq safely escapes field values rather than relying on
+          # manual JSON string concatenation.
+          # ----------------------------------------------------------
+          body="$(
+            jq -cn \
+              --arg productId "$BILLIXI_PRODUCT_ID" \
+              --arg artifactName "$(basename -- "$BILLIXI_ARTIFACT_PATH")" \
+              --arg artifactSha256 "$artifact_sha256" \
+              '{
+                productId: $productId,
+                artifactName: $artifactName,
+                artifactSha256: $artifactSha256
+              }'
+          )"
+
+          # ----------------------------------------------------------
+          # 5. Submit the proof using the GitHub-signed JWT as the
+          #    HTTP bearer credential.
+          #
+          # Fail on non-2xx responses. Do not automatically retry this
+          # POST unless the verification API documents idempotent retry
+          # behavior.
+          # ----------------------------------------------------------
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --silent \
+            --show-error \
+            --fail \
+            --connect-timeout 10 \
+            --max-time 30 \
+            -H "Authorization: Bearer ${oidc_token}" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json' \
+            --data-binary "$body" \
+            --output /dev/null \
+            "$BILLIXI_PROOF_ENDPOINT"
+
+          # Pass the verified digest between steps without printing
+          # sensitive token material.
+          printf 'sha256=%s\n' "$artifact_sha256" >> "$GITHUB_OUTPUT"
+
+          # Explicitly remove token-bearing variables from this shell.
+          unset oidc_token oidc_response body
+
+          echo "Billixi accepted the build-proof request for SHA-256 ${artifact_sha256}."
+
+      - name: Publish the verified bytes as a GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          PROVEN_SHA256: ${{ steps.prove.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+
+          tag="v${RELEASE_VERSION}"
+
+          # ----------------------------------------------------------
+          # 1. Re-hash immediately before publication.
+          #    The released file must match the digest that was proved.
+          # ----------------------------------------------------------
+          test -s "$BILLIXI_ARTIFACT_PATH"
+
+          current_sha256="$(
+            sha256sum -- "$BILLIXI_ARTIFACT_PATH" |
+              awk '{print $1}'
+          )"
+
+          if [[ "$current_sha256" != "$PROVEN_SHA256" ]]; then
+            echo "::error::Artifact changed after proof submission. Refusing to publish."
+            exit 1
+          fi
+
+          # ----------------------------------------------------------
+          # 2. Create the version tag on the exact checked-out commit.
+          #
+          # The earlier remote check provides a clear error message.
+          # The non-force push below is the final collision safeguard:
+          # a competing run cannot overwrite an existing remote tag.
+          # ----------------------------------------------------------
+          git \
+            -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            tag -a "$tag" "$GITHUB_SHA" -m "Release ${tag}"
+
+          git push origin "refs/tags/${tag}"
+
+          # ----------------------------------------------------------
+          # 3. Publish the exact same archive.
+          #
+          # --verify-tag refuses to create a release unless the tag
+          # exists remotely. The tag was explicitly pushed above.
+          # Generate release notes using GitHub's release API.
+          # ----------------------------------------------------------
+          release_args=(
+            --title "$tag"
+            --verify-tag
+            --generate-notes
+          )
+
+          # Mark versions such as 1.2.3-rc.1 as prereleases.
+          # A hyphen appearing only in build metadata does not count.
+          version_without_build="${RELEASE_VERSION%%+*}"
+
+          if [[ "$version_without_build" == *-* ]]; then
+            release_args+=(--prerelease)
+          fi
+
+          gh release create \
+            "$tag" \
+            "$BILLIXI_ARTIFACT_PATH" \
+            "${release_args[@]}"
+
+          echo "Release ${tag} published with verified SHA-256 ${current_sha256}."
